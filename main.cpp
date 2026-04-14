@@ -18,12 +18,14 @@ static constexpr double PI = 3.14159265358979323846;
 // ── Configuration ──────────────────────────────────────────────────────────────
 
 static constexpr uint32_t SAMPLE_RATE    = 3000000;   // 3 MSPS
-static constexpr uint32_t SENSITIVITY    = 21;        // 0-21, max sensitivity for no-antenna use
+static constexpr uint32_t SENSITIVITY    = 15;        // 0-21
+static constexpr double   WARMUP_SECS    = 5.0;       // discard initial samples while AGC settles
 static constexpr double   CAPTURE_SECS   = 10.0;      // must exceed max inter-pulse interval (2s)
 static constexpr int      FFT_SIZE       = 4096;      // ~732 Hz per bin at 3 MSPS
 static constexpr double   SIGNAL_BW_HZ   = 3000.0;    // only look ±3 kHz around center freq
 static constexpr double   DEFAULT_MARGIN = 3.0;       // 3 dB = collar must be ≥50% of reference power
 static constexpr double   MIN_SNR_DB     = 10.0;      // min peak-to-noise dB to consider a signal present
+static constexpr int      REF_MAX_AGE_HOURS = 24;     // reference expires after this many hours
 
 static const char* REF_FILENAME = "collar_ref.dat";
 
@@ -227,6 +229,31 @@ static PowerResult capture_power(uint32_t freq_hz) {
     check(airspy_set_freq(device, freq_hz), "set_freq");
     check(airspy_set_sensitivity_gain(device, SENSITIVITY), "set_sensitivity_gain");
 
+    // Warmup: capture and discard initial samples while AGC/PLL settle
+    size_t warmup_iq_pairs = static_cast<size_t>(SAMPLE_RATE * WARMUP_SECS);
+
+    CaptureContext warmup_ctx;
+    warmup_ctx.buffer.resize(warmup_iq_pairs * 2);
+    warmup_ctx.target_iq_pairs = warmup_iq_pairs;
+    warmup_ctx.collected = 0;
+    warmup_ctx.done = false;
+
+    check(airspy_start_rx(device, rx_callback, &warmup_ctx), "start_rx (warmup)");
+
+    {
+        std::unique_lock<std::mutex> lock(warmup_ctx.mtx);
+        auto timeout = std::chrono::seconds(static_cast<int>(WARMUP_SECS) + 5);
+        if (!warmup_ctx.cv.wait_for(lock, timeout, [&] { return warmup_ctx.done; })) {
+            airspy_stop_rx(device);
+            airspy_close(device);
+            fprintf(stderr, "Error: warmup timed out. Check Airspy connection.\n");
+            exit(1);
+        }
+    }
+
+    airspy_stop_rx(device);
+
+    // Now capture the real data
     size_t total_iq_pairs = static_cast<size_t>(SAMPLE_RATE * CAPTURE_SECS);
 
     CaptureContext ctx;
@@ -292,7 +319,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    uint32_t freq_hz = static_cast<uint32_t>(freq_mhz * 1e6);
+    uint32_t freq_hz = static_cast<uint32_t>(std::round(freq_mhz * 1e6));
 
     // In test mode, verify reference file exists before capturing
     std::filesystem::path ref_path;
@@ -305,9 +332,18 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "Run with --calibrate first using a known-good collar.\n");
             return 1;
         }
-        if (ref_freq_hz != freq_hz) {
-            fprintf(stderr, "Warning: reference was calibrated at %.3f MHz, testing at %.3f MHz\n",
-                    ref_freq_hz / 1e6, freq_mhz);
+        // Check reference file age
+        std::error_code ec;
+        auto ftime = std::filesystem::last_write_time(ref_path, ec);
+        if (!ec) {
+            auto age = std::filesystem::file_time_type::clock::now() - ftime;
+            auto age_hours = std::chrono::duration_cast<std::chrono::hours>(age).count();
+            if (age_hours >= REF_MAX_AGE_HOURS) {
+                fprintf(stderr, "Error: reference calibration is %ld hours old (max %d hours).\n",
+                        static_cast<long>(age_hours), REF_MAX_AGE_HOURS);
+                fprintf(stderr, "Run with --calibrate to re-calibrate.\n");
+                return 1;
+            }
         }
     }
 
@@ -343,6 +379,9 @@ int main(int argc, char* argv[]) {
 
     printf("Reference: %.1f dBFS | Measured: %.1f dBFS | Diff: %.1f dB | Margin: %.1f dB\n",
            ref_power_db, pr.peak_db, diff, margin_db);
+
+    double pct = 100.0 * std::pow(10.0, -diff / 10.0);
+    printf("Signal strength: %.0f%% of reference\n", pct);
 
     if (diff <= margin_db) {
         printf("\n  *** GOOD ***\n\n");
