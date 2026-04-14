@@ -17,15 +17,18 @@ jobs:
       - name: Install dependencies
         run: brew install libusb
 
-      - name: Build
-        run: make
+      - name: Build and install
+        run: make install
 
       - name: Verify no runtime deps on homebrew
         run: |
-          otool -L build/collar_tester
-          ! otool -L build/collar_tester | grep -q /opt/homebrew
+          otool -L /Applications/CollarTest.app/Contents/MacOS/collar_tester
+          ! otool -L /Applications/CollarTest.app/Contents/MacOS/collar_tester | grep -q /opt/homebrew
+
+      - name: Package app
+        run: cd /Applications && zip -r /tmp/CollarTest.zip CollarTest.app
 
       - uses: actions/upload-artifact@v4
         with:
-          name: collar_tester
-          path: build/collar_tester
+          name: CollarTest
+          path: /tmp/CollarTest.zip
