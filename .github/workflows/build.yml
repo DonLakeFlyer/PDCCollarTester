@@ -1,0 +1,31 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: brew install libusb
+
+      - name: Build
+        run: make
+
+      - name: Verify no runtime deps on homebrew
+        run: |
+          otool -L build/collar_tester
+          ! otool -L build/collar_tester | grep -q /opt/homebrew
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: collar_tester
+          path: build/collar_tester
