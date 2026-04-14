@@ -1,0 +1,3 @@
+[submodule "lib/airspyone_host"]
+	path = lib/airspyone_host
+	url = https://github.com/airspy/airspyone_host.git
